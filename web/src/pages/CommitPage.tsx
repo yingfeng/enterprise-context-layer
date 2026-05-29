@@ -104,7 +104,7 @@ export default function CommitPage() {
       <main className="main">
         {error && <div className="error-bar">{error}</div>}
         {selFile ? (
-          <div className="editor-view" style={{display:'flex',flexDirection:'column',height:'100%'}}>
+          <div className="editor-view">
             <div className="editor-toolbar">
               <div className="editor-toolbar-left">
                 <span><strong>{selFile.name}</strong></span>
@@ -114,6 +114,7 @@ export default function CommitPage() {
             </div>
             <div style={{flex:1,overflow:'hidden'}}>
               <MarkdownEditor
+                key={selFile.id}
                 content={content}
                 onChange={() => {}}
                 readOnly

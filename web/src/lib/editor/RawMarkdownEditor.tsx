@@ -46,7 +46,7 @@ function defineTheme(monaco: typeof import('monaco-editor'), isDark: boolean) {
   return name;
 }
 
-export default function RawMarkdownEditor({ content, onChange, readOnly = false, onToggleSource }: Props): JSX.Element {
+export default function RawMarkdownEditor({ content, onChange, readOnly = false, onToggleSource, showSource: _showSource }: Props & { showSource?: boolean }): JSX.Element {
   const { theme } = useTheme();
   const editorRef = useRef<monacoEditor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof import('monaco-editor') | null>(null);

@@ -106,7 +106,7 @@ export default function LexicalEditor({ content, onChange, readOnly = false, pla
       <div className="editor-shell">
         <LexicalComposer initialConfig={initialConfig}>
           <div className="editor-container">
-            {!readOnly && <ToolbarPlugin onToggleSource={onToggleSource || (() => {})} showSource={showSource} />}
+            <ToolbarPlugin onToggleSource={onToggleSource || (() => {})} showSource={showSource} />
             <InitialContentPlugin content={content} transformers={transformers} />
             <ChangeListener onChange={onChange} transformers={transformers} />
             <FloatingSelectionToolbar />
