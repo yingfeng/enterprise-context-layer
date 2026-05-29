@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import type { TreeNode } from '../types'
 import * as api from '../api'
+import { renderMarkdown } from '../lib/markdown'
 
 export default function CommitPage() {
   const { name, commitId } = useParams()
@@ -109,11 +110,16 @@ export default function CommitPage() {
               </div>
               <Link to="/" className="btn">Back to Home</Link>
             </div>
-            <div className="editor-body">
-              <textarea className="editor-textarea" value={content} readOnly placeholder="File content at this version..." />
-              <div className="preview-pane">
-                <div className="preview-hdr">Preview</div>
-                <div className="preview-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />
+            <div className="editor-body" style={{flex:1,display:'flex',overflow:'hidden'}}>
+              <div className="editor-pane edit-pane">
+                <div className="pane-label"><strong>{selFile.name}</strong> · Read-only</div>
+                <textarea className="editor-textarea" value={content} readOnly placeholder="File content at this version..." />
+              </div>
+              <div className="editor-pane preview-pane">
+                <div className="pane-label">Preview</div>
+                <div className="preview-scroll">
+                  <div className="preview-body" dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />
+                </div>
               </div>
             </div>
           </div>
@@ -140,14 +146,4 @@ function findBreadcrumbNode(tree: TreeNode, breadcrumb: { id: string; name: stri
   }
   walk(tree, 0)
   return result
-}
-
-function renderMarkdown(md: string): string {
-  return md
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>').replace(/^## (.+)$/gm, '<h2>$1</h2>').replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>').replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="lang-$1">$2</code></pre>').replace(/`(.+?)`/g, '<code>$1</code>')
-    .replace(/^- (.+)$/gm, '<li class="bullet">$1</li>').replace(/^(\d+)\. (.+)$/gm, '<li class="num">$2</li>')
-    .replace(/!\[(.*?)\]\((.*?)\)/g, '<img alt="$1" src="$2" />').replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>')
-    .replace(/\n\n/g, '</p><p>').replace(/\n/g, '<br/>')
 }

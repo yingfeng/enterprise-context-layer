@@ -2,6 +2,7 @@ import { useState, useEffect, useRef } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import type { TreeNode, FileCommit, Dataset } from '../types'
 import * as api from '../api'
+import MarkdownEditor from '../components/MarkdownEditor'
 
 export default function WorkspacePage() {
   const { name } = useParams()
@@ -363,15 +364,11 @@ export default function WorkspacePage() {
                 {dirty && <button className="btn-primary" onClick={() => setShowCommitDlg(true)}>Commit Changes</button>}
               </div>
             </div>
-            <div className="editor-body">
-              <textarea className="editor-textarea" value={content}
-                onChange={e => { setContent(e.target.value); setDirty(e.target.value !== origContent) }}
-                placeholder="Start writing in Markdown..." spellCheck={false} />
-              <div className="preview-pane">
-                <div className="preview-hdr">Preview</div>
-                <div className="preview-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />
-              </div>
-            </div>
+            <MarkdownEditor
+              content={content}
+              onChange={text => { setContent(text); setDirty(text !== origContent) }}
+              fileName={selFile?.name}
+            />
             {dirty && (
               <div className="editor-footer">
                 <span className="footer-dirty">● Unsaved changes</span>
@@ -482,23 +479,6 @@ function findNode(tree: TreeNode, id: string): TreeNode | undefined {
     const found = findNode(child, id)
     if (found) return found
   }
-}
-
-function renderMarkdown(md: string): string {
-  return md
-    .replace(/^### (.+)$/gm, '<h3>$1</h3>')
-    .replace(/^## (.+)$/gm, '<h2>$1</h2>')
-    .replace(/^# (.+)$/gm, '<h1>$1</h1>')
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/\*(.+?)\*/g, '<em>$1</em>')
-    .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code class="lang-$1">$2</code></pre>')
-    .replace(/`(.+?)`/g, '<code>$1</code>')
-    .replace(/^- (.+)$/gm, '<li class="bullet">$1</li>')
-    .replace(/^(\d+)\. (.+)$/gm, '<li class="num">$2</li>')
-    .replace(/!\[(.*?)\]\((.*?)\)/g, '<img alt="$1" src="$2" />')
-    .replace(/\[(.*?)\]\((.*?)\)/g, '<a href="$2">$1</a>')
-    .replace(/\n\n/g, '</p><p>')
-    .replace(/\n/g, '<br/>')
 }
 
 function fmtTime(ts?: number): string {
