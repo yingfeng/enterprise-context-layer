@@ -9,19 +9,23 @@ import (
 )
 
 type Config struct {
-	ServerHost  string
-	ServerPort  string
-	MySQLDSN    string
-	MinIOHost   string
-	MinIOUser   string
-	MinIOPass   string
-	MinIOSecure bool
-	MinIOBucket string
-	LLMAPIKey   string
-	LLMModel    string
-	LLMBaseURL  string
-	LLMMaxTokens int
+	ServerHost    string
+	ServerPort    string
+	MySQLDSN      string
+	MinIOHost     string
+	MinIOUser     string
+	MinIOPass     string
+	MinIOSecure   bool
+	MinIOBucket   string
+	LLMAPIKey     string
+	LLMModel      string
+	LLMBaseURL    string
+	LLMMaxTokens  int
 	LLMTemperature float64
+	RedisAddr     string
+	RedisDB       int
+	RedisUser     string
+	RedisPass     string
 }
 
 type yamlConfig struct {
@@ -49,6 +53,12 @@ type yamlConfig struct {
 		MaxTokens   int     `yaml:"max_tokens"`
 		Temperature float64 `yaml:"temperature"`
 	} `yaml:"llm"`
+	Redis struct {
+		Host     string `yaml:"host"`
+		DB       int    `yaml:"db"`
+		Username string `yaml:"username"`
+		Password string `yaml:"password"`
+	} `yaml:"redis"`
 }
 
 func Load() *Config {
@@ -67,6 +77,9 @@ func Load() *Config {
 	yc.LLM.BaseURL = "https://api.deepseek.com/v1"
 	yc.LLM.MaxTokens = 16384
 	yc.LLM.Temperature = 0.3
+	yc.Redis.Host = "localhost:6379"
+	yc.Redis.DB = 1
+	yc.Redis.Password = "infini_rag_flow"
 
 	// 尝试从多个位置加载 YAML 配置文件
 	tryLoadYAML(yc, "config.yaml")
@@ -116,6 +129,12 @@ func Load() *Config {
 	if v := os.Getenv("LLM_BASE_URL"); v != "" {
 		yc.LLM.BaseURL = v
 	}
+	if v := os.Getenv("REDIS_HOST"); v != "" {
+		yc.Redis.Host = v
+	}
+	if v := os.Getenv("REDIS_PASSWORD"); v != "" {
+		yc.Redis.Password = v
+	}
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		yc.MySQL.User, yc.MySQL.Password,
@@ -136,6 +155,10 @@ func Load() *Config {
 		LLMBaseURL:    yc.LLM.BaseURL,
 		LLMMaxTokens:  yc.LLM.MaxTokens,
 		LLMTemperature: yc.LLM.Temperature,
+		RedisAddr:     yc.Redis.Host,
+		RedisDB:       yc.Redis.DB,
+		RedisUser:     yc.Redis.Username,
+		RedisPass:     yc.Redis.Password,
 	}
 }
 

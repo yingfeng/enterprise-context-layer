@@ -23,3 +23,9 @@ llm:
   base_url: "https://api.deepseek.com/v1"
   max_tokens: 16384
   temperature: 0.3
+
+redis:
+  host: "localhost:6379"
+  db: 1
+  username: ''
+  password: 'infini_rag_flow'

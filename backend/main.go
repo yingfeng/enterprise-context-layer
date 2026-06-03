@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log"
 	"llmwiki/backend/agent"
@@ -12,6 +13,7 @@ import (
 	"llmwiki/backend/storage"
 
 	"github.com/gin-gonic/gin"
+	"github.com/go-redis/redis/v8"
 )
 
 func main() {
@@ -35,9 +37,21 @@ func main() {
 	datasetSvc := service.NewDatasetService()
 	docSvc := service.NewDocumentService()
 
-	// 4. Initialize Agent Compiler
+	// 4. Initialize Redis for checkpointing
+	rdb := redis.NewClient(&redis.Options{
+		Addr:     cfg.RedisAddr,
+		DB:       cfg.RedisDB,
+		Username: cfg.RedisUser,
+		Password: cfg.RedisPass,
+	})
+	if err := rdb.Ping(context.Background()).Err(); err != nil {
+		log.Fatalf("Failed to connect to Redis: %v", err)
+	}
+	log.Printf("Redis connected (%s db=%d)", cfg.RedisAddr, cfg.RedisDB)
+
+	// 5. Initialize Agent Compiler
 	llmClient := agent.NewLLMClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel)
-	compiler := agent.NewCompiler(fileSvc, llmClient)
+	compiler := agent.NewCompiler(fileSvc, llmClient, rdb)
 	log.Printf("Agent compiler initialized (model=%s, base=%s)", cfg.LLMModel, cfg.LLMBaseURL)
 
 	// 5. Initialize handlers

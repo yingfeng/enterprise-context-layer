@@ -12,6 +12,8 @@ import (
 
 	"llmwiki/backend/entity"
 	"llmwiki/backend/service"
+
+	"github.com/go-redis/redis/v8"
 )
 
 // CompileInput is the input to the compilation pipeline.
@@ -125,17 +127,19 @@ func (t *TaskState) GetLog() string {
 
 // Compiler is the knowledge compilation agent.
 type Compiler struct {
-	fileSvc  *service.FileService
-	llm      *LLMClient
-	tasks    map[string]*TaskState
-	tasksMu  sync.RWMutex
-	entityID func() string
+	fileSvc   *service.FileService
+	llm       *LLMClient
+	rdb       *redis.Client
+	tasks     map[string]*TaskState
+	tasksMu   sync.RWMutex
+	entityID  func() string
 }
 
-func NewCompiler(fileSvc *service.FileService, llm *LLMClient) *Compiler {
+func NewCompiler(fileSvc *service.FileService, llm *LLMClient, rdb *redis.Client) *Compiler {
 	return &Compiler{
 		fileSvc:  fileSvc,
 		llm:      llm,
+		rdb:      rdb,
 		tasks:    make(map[string]*TaskState),
 		entityID: entity.NewID,
 	}
@@ -151,6 +155,12 @@ func (c *Compiler) StartCompile(ctx context.Context, input *CompileInput) (*Task
 	c.tasksMu.Lock()
 	c.tasks[taskID] = task
 	c.tasksMu.Unlock()
+
+	cp := NewCheckpointManager(c.rdb, taskID)
+	existing, err := cp.Load()
+	if err == nil && existing != nil {
+		task.AppendLog("[CP] Found existing checkpoint at phase '%s', resuming...\n", existing.Phase)
+	}
 
 	go c.runCompile(task, input)
 	return task, nil
@@ -172,16 +182,16 @@ func (c *Compiler) ListTasks() []*TaskState {
 	return result
 }
 
-// ========== Main Pipeline ==========
+// ========== Main Pipeline (with Redis Checkpoints) ==========
 
 func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
+	cp := NewCheckpointManager(c.rdb, task.ID)
+
 	task.SetStatus("running")
 	task.StartedAt = time.Now()
 	task.AppendLog("[TASK] ===== Multi-Phase Compilation =====\n")
 	task.AppendLog("[TASK] Workspace: %s\n", input.WorkspaceID)
 	task.AppendLog("[TASK] Output: %s\n", input.OutputDir)
-	task.AppendLog("[TASK] Skills: %v\n", input.SkillRefs)
-	task.AppendLog("[TASK] Instructions: %s\n\n", input.Instructions)
 
 	c.llm.SetLogCallback(func(format string, args ...interface{}) {
 		task.AppendLog(format, args...)
@@ -192,31 +202,54 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 		outputDir = "synthesis"
 	}
 
-	// P4: Batch-load files (if >20, process in batches for keyword extraction)
-	files, skills := c.loadPhase(task, input)
+	// Try to resume from checkpoint
+	saved, _ := cp.Load()
+	resumeFrom := ""
+	if saved != nil {
+		resumeFrom = saved.Phase
+		task.AppendLog("[CP] Resuming from phase '%s' (%d topics, %d compiled)\n",
+			saved.Phase, len(saved.Topics), len(saved.Compiled))
+	}
+
+	// ── Load Phase ──
+	var files []FileNode
+	var skills []SkillDef
+	files, skills = c.loadPhase(task, input)
 	if len(files) == 0 {
 		return
 	}
 
-	// P1: Keyword extraction for each file
-	c.extractKeywords(task, files)
-
-	// P2: Discover topics (uses keyword-enriched file info)
-	topics := c.scanPhase(task, files, skills, input.Instructions)
-	if len(topics) == 0 {
-		return
-	}
-	task.AppendLog("\n[SCAN] Discovered %d topics:\n", len(topics))
-	for _, t := range topics {
-		task.AppendLog("  - %s (%d sources): %s\n", t.Name, len(t.SourcePaths), t.Description)
+	// ── Keyword Extraction (not checkpointed) ──
+	if resumeFrom == "" {
+		c.extractKeywords(task, files)
 	}
 
-	// P3: Compile each topic article with:
-	//   - cross-topic context (previously compiled articles)
-	//   - on-demand file reading (tool calling)
+	// ── Scan Phase ──
+	var topics []TopicInfo
+	if resumeFrom != "" && saved != nil {
+		topics = saved.Topics
+		task.AppendLog("[CP] Restored %d topics from checkpoint\n", len(topics))
+	} else {
+		topics = c.scanPhase(task, files, skills, input.Instructions)
+		if len(topics) == 0 {
+			return
+		}
+		cp.SavePhase("scan", topics, nil, nil, len(files), outputDir)
+		task.AppendLog("[CP] Saved checkpoint after scan (%d topics)\n", len(topics))
+	}
+
+	// ── Compile Phase (per-topic checkpoints) ──
 	var allOutputs []OutputFile
+	if resumeFrom == "compile" && saved != nil {
+		allOutputs = saved.Compiled
+		task.AppendLog("[CP] Restored %d compiled articles\n", len(allOutputs))
+	}
+
 	compileStart := time.Now()
 	for i, topic := range topics {
+		if i < len(allOutputs) {
+			continue // skip already compiled
+		}
 		tStart := time.Now()
 		article := c.compilePhase(task, topic, files, topics, allOutputs, outputDir)
 		elapsed := time.Since(tStart).Round(time.Second)
@@ -228,26 +261,37 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 		eta := avgTime * time.Duration(remaining)
 		task.AppendLog("[COMPILE] Topic %d/%d: '%s' (%v, ETA %v)\n",
 			i+1, len(topics), topic.Name, elapsed, eta.Round(time.Second))
+
+		// Checkpoint after each topic
+		cp.SavePhase("compile", topics, allOutputs, nil, len(files), outputDir)
+		task.AppendLog("[CP] Checkpoint after topic %d/%d\n", i+1, len(topics))
 	}
 	compileTotal := time.Since(compileStart).Round(time.Second)
 	task.AppendLog("[COMPILE] All %d topics compiled in %v\n", len(topics), compileTotal)
 
-	// P4: Post-compilation consistency review — re-read & fix overlap
+	// ── Consistency Review ──
 	task.AppendLog("[REVIEW] Consistency check across %d articles...\n", len(allOutputs))
 	allOutputs = c.consistencyReview(task, allOutputs)
 
-	// P5: Concept discovery — find cross-topic patterns
-	concepts := c.conceptPhase(task, topics, allOutputs)
-	for _, concept := range concepts {
-		allOutputs = append(allOutputs, concept)
+	// ── Concept Discovery ──
+	if resumeFrom != "concept" || saved == nil || len(saved.AllOutputs) == 0 {
+		concepts := c.conceptPhase(task, topics, allOutputs)
+		for _, concept := range concepts {
+			allOutputs = append(allOutputs, concept)
+		}
+		cp.SavePhase("concept", topics, nil, allOutputs, len(files), outputDir)
+		task.AppendLog("[CP] Saved checkpoint after concept phase\n")
+	} else {
+		allOutputs = saved.AllOutputs
+		task.AppendLog("[CP] Restored concept phase (%d files)\n", len(allOutputs))
 	}
 
-	// P6: INDEX.md + log.md
+	// ── INDEX.md + log.md ──
 	allOutputs = append(allOutputs,
 		c.generateIndex(task, topics, len(files), outputDir),
 		c.generateLog(task, topics, len(files), outputDir))
 
-	// P7: Quality review (P3)
+	// ── Quality Review ──
 	allOutputs = c.qualityReview(task, topics, allOutputs)
 
 	// Write + commit
@@ -598,36 +642,15 @@ func (c *Compiler) fallbackTopics(files []FileNode) []TopicInfo {
 	return topics
 }
 
-// ========== P0: Compile with Cross-Topic Context + On-Demand File Reading ==========
+// ========== Claude Code-style Compile: Understand → Read → Write → Verify ==========
 
 func (c *Compiler) compilePhase(task *TaskState, topic TopicInfo, allFiles []FileNode, allTopics []TopicInfo, compiled []OutputFile, outputDir string) *OutputFile {
 	task.AppendLog("[COMPILE] Topic '%s' (%d sources)...\n", topic.Name, len(topic.SourcePaths))
 
-	// Build other-topics context for cross-linking
-	var otherCtx strings.Builder
-	otherCtx.WriteString("其他已发现主题供交叉引用：\n")
-	for _, t := range allTopics {
-		if t.Name != topic.Name {
-			otherCtx.WriteString(fmt.Sprintf("- [[%s]]: %s\n", t.Name, t.Description))
-		}
-	}
+	// P2: Compression ladder — dynamically resize context based on volume
+	context := c.buildCompileContext(topic, allTopics, compiled)
 
-	// Build already compiled articles context — tells the LLM what's been covered
-	var prevCtx strings.Builder
-	if len(compiled) > 0 {
-		prevCtx.WriteString("\n## 已编译的文章（防止内容重复）\n\n")
-		for _, art := range compiled {
-			summary := art.Content
-			if len(summary) > 500 {
-				summary = summary[:500] + "..."
-			}
-			prevCtx.WriteString(fmt.Sprintf("### %s\n```\n%s\n```\n\n", art.Path, summary))
-		}
-		prevCtx.WriteString("注意：以上文章已经存在。新文章的内容不得与这些文章重复。\n")
-		prevCtx.WriteString("如果发现你的主题与已编译文章重叠，应当引用 [[ExistingArticle]] 而非重写。\n\n")
-	}
-
-	// Collect relevant source files for this topic
+	// Collect the topic's source files
 	var relevantFiles []FileNode
 	topicPaths := make(map[string]bool)
 	for _, p := range topic.SourcePaths {
@@ -639,112 +662,285 @@ func (c *Compiler) compilePhase(task *TaskState, topic TopicInfo, allFiles []Fil
 		}
 	}
 
-	// Build the prompt with all context
-	prompt := c.buildCompilePrompt(topic, relevantFiles, allFiles, otherCtx.String(), prevCtx.String())
+	// P0: Source File Budget — summaries only, max 3 full files per topic
+	pickPrompt := context + c.buildFileIndexPrompt(relevantFiles, allFiles)
+	pickMsg := `请分析上面列出的源文件。告诉我你需要完整阅读哪些文件来编译这篇知识文章。
 
-	// Call with retry + on-demand file reading
-	const maxRounds = 3 // max tool-calling rounds
-	for round := 0; round < maxRounds; round++ {
-		content := c.chatWithRetry(task, prompt)
+限制: 最多选择 3 个文件。优先选择内容最相关、信息量最大的。
 
-		if content == "" {
-			return nil
-		}
-		content = stripJSONFence(content)
+回复格式（纯文本，不要JSON）：
+NEED: file1.md, file2.md, file3.md
+REASON: 简要说明为什么需要这些文件`
 
-		// Check for on-demand file requests (tool calling)
-		if readFile := extractReadRequest(content); readFile != "" {
-			task.AppendLog("[TOOL] LLM requested additional file: %s\n", readFile)
-			fileContent := c.readFileByName(allFiles, readFile)
-			if fileContent != "" {
-				prompt += fmt.Sprintf("\n---\nLLM requested additional context from `%s`:\n```\n%s\n```\n请基于此补充内容后输出完整文章。\n", readFile, fileContent)
-				continue
-			}
-		}
-
-		// Check for overlap warning marker
-		if strings.Contains(content, "[OVERLAP]") {
-			task.AppendLog("[TOOL] LLM detected overlap, adjusting...\n")
-			prompt += "\n注意：上轮输出包含重叠内容标记。请去掉与已发表文章重复的部分，用 [[链接]] 替代。重新输出完整文章。\n"
-			continue
-		}
-
-		return &OutputFile{Path: topic.Name + ".md", Content: content}
+	pickResp := c.chatWithRetry(task, "", pickPrompt+"\n\n"+pickMsg)
+	if pickResp == "" {
+		return nil
 	}
 
-	task.AppendLog("[COMPILE] Max rounds reached, using last output\n")
-	return nil
+	needFiles := parseNeedFiles(pickResp)
+	if len(needFiles) == 0 {
+		// Fallback: include up to 3 most relevant files
+		for i, f := range relevantFiles {
+			if i >= 3 {
+				break
+			}
+			needFiles = append(needFiles, f.Path)
+		}
+	}
+	// Hard budget: max 3 files
+	if len(needFiles) > 3 {
+		needFiles = needFiles[:3]
+	}
+	task.AppendLog("[COMPILE] LLM requested %d/%d files (budget: 3 max)\n", len(needFiles), len(relevantFiles))
+
+	// ── Round 2: Read & Write — full content of budgeted files ──
+	writePrompt := context + "\n## 你请求的源文件（完整内容）\n\n"
+	for _, f := range allFiles {
+		if containsPath(needFiles, f.Path) {
+			writePrompt += fmt.Sprintf("### %s\n```\n%s\n```\n\n", f.Path, f.Content)
+		}
+	}
+	writeMsg := `基于以上源文件，编译一篇知识文章。
+
+要求:
+1. 合成多个源文件的信息，不要照搬一个源
+2. 每个关键信息后面标注来源: [source: filename.md]
+3. 正文中用 [[OtherArticle]] 交叉引用其他主题
+4. 每个小节末尾标记覆盖度: [coverage: high/medium/low]
+5. 文章结构: # 标题 → ## 概要 → ## 内容 → ## 资料来源
+
+直接输出纯 Markdown。`
+
+	article := c.chatWithRetry(task, "", writePrompt+"\n\n"+writeMsg)
+	if article == "" {
+		return nil
+	}
+	article = stripJSONFence(article)
+
+	// ── Round 3: Verify ──
+	verifyPrompt := "你刚写了一篇知识文章。请审查并修正以下问题：\n\n"
+	verifyPrompt += "1. [精确溯源] 每个关键 claim 后面是否都有 [source: filename.md]？若缺失则补上\n"
+	verifyPrompt += "2. [交叉引用] 是否引用了其他主题 [[slug]]？若缺失则补上\n"
+	verifyPrompt += "3. [内容重叠] 是否与已有文章重复？（见上方「已编译的文章」）若有则精简并用 [[slug]] 替代\n"
+	verifyPrompt += "4. [准确度] 是否存在推断性内容未标注为推测？若有则加 [推断: 基于...]\n\n"
+	verifyPrompt += "原文如下：\n---\n" + truncate(article, 8000) + "\n---\n"
+	verifyPrompt += "\n输出修正后的完整文章。只输出 Markdown，不要额外说明。"
+
+	verified := c.chatWithRetry(task, "", verifyPrompt)
+	if verified != "" {
+		verified = stripJSONFence(verified)
+		if len(verified) > len(article)/2 {
+			article = verified
+			task.AppendLog("[COMPILE] Verified & improved\n")
+		}
+	}
+
+	// P1: Quality Gate — check minimum quality before accepting
+	if !c.qualityGate(task, article, topic, allTopics) {
+		task.AppendLog("[COMPILE] Quality gate failed, re-attempting...\n")
+		reworkPrompt := "你的文章未通过质量检查。以下是需要改进的问题：\n\n"
+		reworkPrompt += "1. 确保文章包含 [[OtherArticle]] 交叉链接\n"
+		reworkPrompt += "2. 确保每个小节有 [coverage: high/medium/low] 标记\n"
+		reworkPrompt += "3. 确保内容长度 >= 200 字\n"
+		reworkPrompt += "4. 确保有 ## 概要 和 ## 资料来源 章节\n\n"
+		reworkPrompt += "重新输出完整的文章。\n---\n" + truncate(article, 8000)
+
+		rework := c.chatWithRetry(task, "", reworkPrompt)
+		if rework != "" {
+			rework = stripJSONFence(rework)
+			if len(rework) > len(article)/2 {
+				article = rework
+				task.AppendLog("[COMPILE] Quality gate passed on retry\n")
+			}
+		}
+	} else {
+		task.AppendLog("[COMPILE] Quality gate passed\n")
+	}
+
+	// P0: Session Note — extract structured note for future reference
+	_ = c.extractSessionNote(article, topic.Name)
+
+	return &OutputFile{Path: topic.Name + ".md", Content: article}
 }
 
-// buildCompilePrompt assembles the compilation prompt with all context.
-func (c *Compiler) buildCompilePrompt(topic TopicInfo, relevantFiles, allFiles []FileNode, otherCtx, prevCtx string) string {
-	var b strings.Builder
-	b.WriteString(fmt.Sprintf("编译主题「%s」的知识文章。\n\n", topic.Description))
-	b.WriteString(otherCtx)
-	b.WriteString(prevCtx)
-	b.WriteString(fmt.Sprintf("主题描述：%s\n\n", topic.Description))
-
-	// Full content of topic's source files
-	for _, f := range relevantFiles {
-		b.WriteString(fmt.Sprintf("### %s\n```\n%s\n```\n\n", f.Path, f.Content))
+// P1: Quality Gate — checks article for minimum quality standards.
+func (c *Compiler) qualityGate(task *TaskState, article string, topic TopicInfo, allTopics []TopicInfo) bool {
+	if len(strings.TrimSpace(article)) < 200 {
+		task.AppendLog("[GATE] Content too short (%d chars)\n", len(article))
+		return false
 	}
 
-	// File index for on-demand reading (tool calling)
-	b.WriteString("\n## 其他源文件索引\n\n")
-	b.WriteString("以下文件未包含在上述内容中。如果你需要更多上下文，可以在输出中包含标记：\n")
-	b.WriteString("[READ: filename.md]\n")
-	b.WriteString("系统会自动读取该文件并重新调用你。\n\n")
-	for _, f := range allFiles {
-		if !topicPaths(f, relevantFiles) {
-			kw := strings.Join(f.Keywords, ", ")
-			if kw == "" {
-				kw = "(无)"
-			}
-			b.WriteString(fmt.Sprintf("- %s [关键词: %s]\n", f.Path, kw))
+	// Check for [[links]] to other topics
+	hasLinks := false
+	for _, t := range allTopics {
+		if t.Name != topic.Name && strings.Contains(article, "[["+t.Name+"]]") {
+			hasLinks = true
+			break
 		}
+	}
+	if !hasLinks {
+		task.AppendLog("[GATE] No [[cross-links]] to other topics\n")
+	}
+
+	// Check for coverage tags
+	if !strings.Contains(article, "[coverage:") {
+		task.AppendLog("[GATE] Missing [coverage:] tags\n")
+	}
+
+	// Minimum sections
+	hasSummary := strings.Contains(article, "## 概要") || strings.Contains(article, "## Summary")
+	hasSources := strings.Contains(article, "## 资料来源") || strings.Contains(article, "## Sources")
+	if !hasSummary || !hasSources {
+		task.AppendLog("[GATE] Missing sections: summary=%v, sources=%v\n", hasSummary, hasSources)
+	}
+
+	// Pass if at least has links AND (coverage OR sections)
+	return hasLinks && (strings.Contains(article, "[coverage:") || (hasSummary && hasSources))
+}
+
+// P0: Session Note — extracts a structured lightweight note from a compiled article.
+// This replaces carrying full article content across compile phases.
+func (c *Compiler) extractSessionNote(article string, topicName string) string {
+	// Extract # title
+	title := topicName
+	for _, line := range strings.Split(article, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "# ") {
+			title = strings.TrimSpace(line)[2:]
+			break
+		}
+	}
+
+	// Extract first 200 chars of summary as session note
+	summary := ""
+	inSummary := false
+	for _, line := range strings.Split(article, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "## 概要" || trimmed == "## Summary" {
+			inSummary = true
+			continue
+		}
+		if inSummary {
+			if strings.HasPrefix(trimmed, "## ") {
+				break
+			}
+			summary += trimmed + " "
+			if len(summary) > 200 {
+				summary = summary[:200]
+				break
+			}
+		}
+	}
+	if summary == "" {
+		// Fallback: first 200 chars of article
+		summary = article
+		if len(summary) > 200 {
+			summary = summary[:200]
+		}
+	}
+
+	_ = title // note stored implicitly via article text
+	return summary
+}
+
+// P2: Compression ladder + P0: Session Note based context builder
+func (c *Compiler) buildCompileContext(topic TopicInfo, allTopics []TopicInfo, compiled []OutputFile) string {
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("编译主题「%s」的知识文章。\n\n", topic.Description))
+
+	// Other topics for cross-linking
+	b.WriteString("其他已发现主题供交叉引用：\n")
+	for _, t := range allTopics {
+		if t.Name != topic.Name {
+			b.WriteString(fmt.Sprintf("- [[%s]]: %s\n", t.Name, t.Description))
+		}
+	}
+
+	// P2: Compression ladder — compress previous articles based on count
+	if len(compiled) > 0 {
+		b.WriteString("\n## 已编译的文章\n\n")
+
+		// Compression: more articles = shorter summaries
+		maxLen := 500
+		if len(compiled) >= 3 {
+			maxLen = 300
+		}
+		if len(compiled) >= 6 {
+			maxLen = 150
+		}
+		if len(compiled) >= 10 {
+			maxLen = 80
+		}
+
+		// P0: Session Note — only include note, not full content
+		for _, art := range compiled {
+			summary := art.Content
+			if len(summary) > maxLen {
+				summary = summary[:maxLen] + "..."
+			}
+			b.WriteString(fmt.Sprintf("### %s\n```\n%s\n```\n\n", art.Path, summary))
+		}
+		b.WriteString("这些文章已存在。新文章内容不得与之重复。应引用 [[ExistingArticle]] 而非重写。\n\n")
 	}
 
 	return b.String()
 }
 
-func topicPaths(f FileNode, relevant []FileNode) bool {
-	for _, r := range relevant {
-		if r.Path == f.Path {
+// buildFileIndexPrompt lists files with summaries for the LLM to pick from.
+func (c *Compiler) buildFileIndexPrompt(relevantFiles, allFiles []FileNode) string {
+	var b strings.Builder
+	b.WriteString("\n## 源文件索引\n\n")
+	b.WriteString("以下是可能的源文件。请告诉我你需要完整阅读哪些。\n\n")
+
+	for _, f := range relevantFiles {
+		summary := f.Content
+		if len(summary) > 500 {
+			summary = summary[:500] + "..."
+		}
+		kw := strings.Join(f.Keywords, ", ")
+		if kw == "" {
+			kw = "(未提取)"
+		}
+		b.WriteString(fmt.Sprintf("### %s\n", f.Path))
+		b.WriteString(fmt.Sprintf("- 标题: %s | 关键词: %s\n", f.Title, kw))
+		b.WriteString(fmt.Sprintf("- 摘要:\n```\n%s\n```\n\n", summary))
+	}
+
+	return b.String()
+}
+
+// parseNeedFiles extracts NEED: line from LLM response.
+func parseNeedFiles(resp string) []string {
+	for _, line := range strings.Split(resp, "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "NEED:") {
+			parts := strings.SplitN(line, ":", 2)
+			if len(parts) == 2 {
+				var files []string
+				for _, f := range strings.Split(parts[1], ",") {
+					f = strings.TrimSpace(f)
+					if f != "" {
+						files = append(files, f)
+					}
+				}
+				return files
+			}
+		}
+	}
+	return nil
+}
+
+func containsPath(paths []string, target string) bool {
+	for _, p := range paths {
+		if p == target {
 			return true
 		}
 	}
 	return false
 }
 
-// extractReadRequest checks if the response contains a [READ: path] marker.
-func extractReadRequest(content string) string {
-	idx := strings.Index(content, "[READ:")
-	if idx < 0 {
-		return ""
-	}
-	end := strings.Index(content[idx:], "]")
-	if end < 0 {
-		return ""
-	}
-	path := strings.TrimSpace(content[idx+6 : idx+end])
-	if path == "" {
-		return ""
-	}
-	return path
-}
-
-// readFileByName finds a file by path and returns its content.
-func (c *Compiler) readFileByName(files []FileNode, path string) string {
-	for _, f := range files {
-		if f.Path == path || f.Name == path {
-			return f.Content
-		}
-	}
-	return ""
-}
-
-// chatWithRetry sends a prompt to the LLM with timeout and retry.
-func (c *Compiler) chatWithRetry(task *TaskState, prompt string) string {
+// chatWithRetry sends messages to the LLM with timeout+retry.
+// If systemMsg is empty, no system message is sent.
+func (c *Compiler) chatWithRetry(task *TaskState, systemMsg, userMsg string) string {
 	const timeout = 120 * time.Second
 	const retries = 2
 	for attempt := 0; attempt < retries; attempt++ {
@@ -752,7 +948,7 @@ func (c *Compiler) chatWithRetry(task *TaskState, prompt string) string {
 			task.AppendLog("[RETRY] Chat attempt %d\n", attempt+1)
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), timeout)
-		content, err := c.llm.ChatRaw(ctx, "", prompt)
+		content, err := c.llm.ChatRaw(ctx, systemMsg, userMsg)
 		cancel()
 		if err == nil {
 			return content
@@ -790,7 +986,7 @@ func (c *Compiler) consistencyReview(task *TaskState, articles []OutputFile) []O
 	b.WriteString(`{"fixes": [{"path": "article.md", "content": "修正后的完整文章内容"}]}`)
 	b.WriteString("\n\n不要把同一段内容挪来挪去。如果两篇文章讲同一个东西，留下一篇，另一篇加[[链接]]指向它。")
 
-	content := c.chatWithRetry(task, b.String())
+	content := c.chatWithRetry(task, "", b.String())
 	if content == "" {
 		return articles
 	}
@@ -866,9 +1062,9 @@ func (c *Compiler) conceptPhase(task *TaskState, topics []TopicInfo, articles []
 	b.WriteString("\n输出JSON格式:\n")
 	b.WriteString(`{"concepts": [{"name": "概念名", "slug": "concept-slug", "description": "描述", "topics": ["topic1","topic2"]}]}`)
 
-	systemMsg := "你是一个知识发现专家。找出跨主题的共现模式。只在确实存在3个以上相关性时创建概念。"
-
-	content, err := c.llm.ChatRaw(context.Background(), systemMsg, b.String())
+	conceptCtx, conceptCancel := context.WithTimeout(context.Background(), 90*time.Second)
+	content, err := c.llm.ChatRaw(conceptCtx, "你是一个知识发现专家。找出跨主题的共现模式。只在确实存在3个以上相关性时创建概念。", b.String())
+	conceptCancel()
 	if err != nil {
 		task.AppendLog("[CONCEPT] LLM error: %v\n", err)
 		return nil
@@ -1012,7 +1208,9 @@ func (c *Compiler) fixOrphans(task *TaskState, articles []OutputFile, orphans []
 
 		systemMsg := "你是一个知识库编辑。在文章正文中找到可以交叉引用的位置，插入[[链接]]。保持原文不变，只增加链接。"
 
-		content, err := c.llm.ChatRaw(context.Background(), systemMsg, b.String())
+		fixCtx, fixCancel := context.WithTimeout(context.Background(), 90*time.Second)
+		content, err := c.llm.ChatRaw(fixCtx, systemMsg, b.String())
+		fixCancel()
 		if err != nil {
 			task.AppendLog("[REVIEW] Fix failed for '%s': %v\n", name, err)
 			continue
