@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -281,43 +283,84 @@ func walkTree(node *entity.TreeNode, parentPath string, nodes *[]FileNode, svc *
 	}
 }
 
-// loadSkills loads skill files from the workspace.
+// loadSkills loads skill files — first from the workspace's skills folder,
+// then falls back to the local filesystem skills/ directory.
 func (c *Compiler) loadSkills(workspaceID string, skillRefs []string) ([]SkillDef, error) {
-	if len(skillRefs) == 0 {
-		return nil, nil
-	}
-
+	// Try workspace first
 	tree, err := c.fileSvc.GetCurrentTree(workspaceID)
-	if err != nil {
-		return nil, err
-	}
-
-	skillsFolderID := findFolderNamed(tree, ".knowledgebase")
-	if skillsFolderID == "" {
-		skillsFolderID = findFolderNamed(tree, "skills")
-	}
-	if skillsFolderID == "" {
-		return nil, nil
-	}
-
-	skillsTree, err := c.fileSvc.GetCurrentTree(skillsFolderID)
-	if err != nil {
-		return nil, err
-	}
-
-	var skills []SkillDef
-	for _, ref := range skillRefs {
-		for _, child := range skillsTree.Children {
-			if child.Type == "file" && child.Name == ref && child.Location != nil && *child.Location != "" {
-				data, err := c.fileSvc.GetStorageData(workspaceID, *child.Location)
-				if err != nil {
-					continue
+	if err == nil && tree != nil {
+		skillsFolderID := findFolderNamed(tree, ".knowledgebase")
+		if skillsFolderID == "" {
+			skillsFolderID = findFolderNamed(tree, "skills")
+		}
+		if skillsFolderID != "" {
+			skillsTree, err := c.fileSvc.GetCurrentTree(skillsFolderID)
+			if err == nil && skillsTree != nil {
+				var skills []SkillDef
+				if len(skillRefs) > 0 {
+					for _, ref := range skillRefs {
+						for _, child := range skillsTree.Children {
+							if child.Type == "file" && child.Name == ref && child.Location != nil && *child.Location != "" {
+								data, err := c.fileSvc.GetStorageData(workspaceID, *child.Location)
+								if err != nil {
+									continue
+								}
+								skills = append(skills, SkillDef{Name: ref, Content: string(data)})
+							}
+						}
+					}
+				} else {
+					for _, child := range skillsTree.Children {
+						if child.Type == "file" && child.Location != nil && *child.Location != "" {
+							data, err := c.fileSvc.GetStorageData(workspaceID, *child.Location)
+							if err != nil {
+								continue
+							}
+							skills = append(skills, SkillDef{Name: child.Name, Content: string(data)})
+						}
+					}
 				}
-				skills = append(skills, SkillDef{Name: ref, Content: string(data)})
+				if len(skills) > 0 {
+					return skills, nil
+				}
 			}
 		}
 	}
-	return skills, nil
+
+	// Fallback: load from local filesystem skills/ directory
+	return loadLocalSkills()
+}
+
+// loadLocalSkills reads skill files from skills/ directory next to the backend.
+func loadLocalSkills() ([]SkillDef, error) {
+	// Try multiple possible locations for the skills directory
+	candidates := []string{
+		"skills",
+		"../skills",
+		filepath.Join("skills", "wiki-compiler"),
+		filepath.Join("..", "skills", "wiki-compiler"),
+	}
+
+	for _, dir := range candidates {
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		var skills []SkillDef
+		for _, e := range entries {
+			if e.IsDir() || filepath.Ext(e.Name()) == ".md" {
+				data, err := os.ReadFile(filepath.Join(dir, e.Name()))
+				if err != nil {
+					continue
+				}
+				skills = append(skills, SkillDef{Name: e.Name(), Content: string(data)})
+			}
+		}
+		if len(skills) > 0 {
+			return skills, nil
+		}
+	}
+	return nil, nil
 }
 
 func findFolderNamed(node *entity.TreeNode, name string) string {
@@ -354,6 +397,18 @@ func (c *Compiler) buildPrompt(files []FileNode, skills []SkillDef, instructions
 	b.WriteString(fmt.Sprintf("\n输出目录: %s\n", outputDir))
 
 	return b.String()
+}
+
+// buildSystemPrompt builds the system prompt for the LLM.
+// All algorithm details come from the loaded skill files (SKILL.md), not from here.
+func (c *Compiler) buildSystemPrompt(skills []SkillDef, outputDir string) string {
+	return `你是一个知识编译专家。下面的 skill 规范定义了完整的编译算法，请严格遵循。
+
+输出纯 JSON 格式。JSON 格式:
+{"files": [{"path": "article-name.md", "content": "# Title\n\ncontent..."}]}
+
+重要: path 只包含文件名（如 "architecture.md"），不要包含目录前缀。
+`
 }
 
 // writeOutputFiles creates output files in a SEPARATE workspace at the root level.

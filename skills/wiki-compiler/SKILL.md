@@ -137,3 +137,14 @@ The compilation result must be a JSON array of output files:
 - `content` is the complete markdown content.
 - Always include INDEX.md and log.md in the output.
 - Files will be created via the backend API (`CreateTextFile`) and committed automatically.
+
+## Cross-Referencing Rules (Critical)
+
+Every article MUST link to related articles using `[[ArticleName]]` wiki links:
+
+- **Format**: `[[FileNameWithoutExtension]]`, e.g. `[[Deep-Learning]]`, `[[AI-Overview]]`
+- **In body text**: When discussing a related topic, link it: "see also [[Memory-Harness-Architecture]]"
+- **In INDEX.md**: The Topics table MUST link each entry with `[[slug]]`
+- **Every article**: Must contain at least 2-3 `[[links]]` to other articles
+
+Why this matters: The llmwiki knowledge graph parses these `[[wiki links]]` to build the graph visualization and enable backlinks. Without them, articles are isolated.

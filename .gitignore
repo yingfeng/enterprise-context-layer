@@ -38,5 +38,6 @@ Thumbs.db
 /build/
 /service-worker.js
 /asset-manifest.json
+backend/backend
 
 /vite.config.js.timestamp-*
