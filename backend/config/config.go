@@ -9,14 +9,19 @@ import (
 )
 
 type Config struct {
-	ServerHost string
-	ServerPort string
-	MySQLDSN   string
-	MinIOHost  string
-	MinIOUser  string
-	MinIOPass  string
+	ServerHost  string
+	ServerPort  string
+	MySQLDSN    string
+	MinIOHost   string
+	MinIOUser   string
+	MinIOPass   string
 	MinIOSecure bool
 	MinIOBucket string
+	LLMAPIKey   string
+	LLMModel    string
+	LLMBaseURL  string
+	LLMMaxTokens int
+	LLMTemperature float64
 }
 
 type yamlConfig struct {
@@ -37,6 +42,13 @@ type yamlConfig struct {
 		Password string `yaml:"password"`
 		Secure   bool   `yaml:"secure"`
 	} `yaml:"minio"`
+	LLM struct {
+		APIKey      string  `yaml:"api_key"`
+		Model       string  `yaml:"model"`
+		BaseURL     string  `yaml:"base_url"`
+		MaxTokens   int     `yaml:"max_tokens"`
+		Temperature float64 `yaml:"temperature"`
+	} `yaml:"llm"`
 }
 
 func Load() *Config {
@@ -51,6 +63,10 @@ func Load() *Config {
 	yc.MinIO.Host = "127.0.0.1:9000"
 	yc.MinIO.User = "rag_flow"
 	yc.MinIO.Password = "infini_rag_flow"
+	yc.LLM.Model = "deepseek-chat"
+	yc.LLM.BaseURL = "https://api.deepseek.com/v1"
+	yc.LLM.MaxTokens = 16384
+	yc.LLM.Temperature = 0.3
 
 	// 尝试从多个位置加载 YAML 配置文件
 	tryLoadYAML(yc, "config.yaml")
@@ -91,6 +107,15 @@ func Load() *Config {
 	if v := os.Getenv("MINIO_SECURE"); v == "true" {
 		yc.MinIO.Secure = true
 	}
+	if v := os.Getenv("LLM_API_KEY"); v != "" {
+		yc.LLM.APIKey = v
+	}
+	if v := os.Getenv("LLM_MODEL"); v != "" {
+		yc.LLM.Model = v
+	}
+	if v := os.Getenv("LLM_BASE_URL"); v != "" {
+		yc.LLM.BaseURL = v
+	}
 
 	dsn := fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?charset=utf8mb4&parseTime=True&loc=Local",
 		yc.MySQL.User, yc.MySQL.Password,
@@ -98,14 +123,19 @@ func Load() *Config {
 		yc.MySQL.Database)
 
 	return &Config{
-		ServerHost: yc.Server.Host,
-		ServerPort: yc.Server.Port,
-		MySQLDSN:   getEnv("MYSQL_DSN", dsn),
-		MinIOHost:  yc.MinIO.Host,
-		MinIOUser:  yc.MinIO.User,
-		MinIOPass:  yc.MinIO.Password,
-		MinIOSecure: yc.MinIO.Secure,
-		MinIOBucket: "llmwiki",
+		ServerHost:    yc.Server.Host,
+		ServerPort:    yc.Server.Port,
+		MySQLDSN:      getEnv("MYSQL_DSN", dsn),
+		MinIOHost:     yc.MinIO.Host,
+		MinIOUser:     yc.MinIO.User,
+		MinIOPass:     yc.MinIO.Password,
+		MinIOSecure:   yc.MinIO.Secure,
+		MinIOBucket:   "llmwiki",
+		LLMAPIKey:     getEnv("LLM_API_KEY", yc.LLM.APIKey),
+		LLMModel:      yc.LLM.Model,
+		LLMBaseURL:    yc.LLM.BaseURL,
+		LLMMaxTokens:  yc.LLM.MaxTokens,
+		LLMTemperature: yc.LLM.Temperature,
 	}
 }
 

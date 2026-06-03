@@ -16,3 +16,10 @@ minio:
   user: "rag_flow"
   password: "infini_rag_flow"
   secure: false
+
+llm:
+  api_key: ""
+  model: "deepseek-chat"
+  base_url: "https://api.deepseek.com/v1"
+  max_tokens: 16384
+  temperature: 0.3

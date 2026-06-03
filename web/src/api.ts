@@ -1,4 +1,4 @@
-import type { TreeNode, FileCommit, Dataset, DocsFile } from './types'
+import type { TreeNode, FileCommit, Dataset, DocsFile, CompileTask } from './types'
 
 const BASE = '/api/v1'
 
@@ -90,4 +90,33 @@ export async function createCommit(
     method: 'POST',
     body: JSON.stringify({ message, files }),
   })
+}
+
+// ===== Agent Compilation APIs =====
+
+export async function startCompile(opts: {
+  workspace_id: string
+  instructions?: string
+  skill_refs?: string[]
+  output_dir?: string
+  commit_message?: string
+}): Promise<{ task_id: string; status: string }> {
+  return api<{ task_id: string; status: string }>('/agent/compile', {
+    method: 'POST',
+    body: JSON.stringify(opts),
+  })
+}
+
+export async function getCompileTask(id: string): Promise<CompileTask> {
+  const r = await api<{ data: CompileTask }>(`/agent/compile/${id}`)
+  return r.data ?? r
+}
+
+export async function listCompileTasks(): Promise<CompileTask[]> {
+  const r = await api<{ data: CompileTask[] }>('/agent/compile/list')
+  return Array.isArray(r) ? r : (r as any).data || []
+}
+
+export function compileLogURL(taskID: string): string {
+  return `${BASE}/agent/compile/${taskID}/logs`
 }

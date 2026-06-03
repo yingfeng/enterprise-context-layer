@@ -48,7 +48,16 @@ export default function RootPage() {
       <main className="main">
         <div className="welcome">
           <h1>📝 llmwiki</h1>
-          <p style={{marginBottom:24}}>A version-controlled wiki powered by Markdown</p>
+          <p style={{marginBottom:16}}>A version-controlled wiki powered by Markdown</p>
+
+          <a href="/compiler" style={{
+            display: 'inline-block', marginBottom: 24, padding: '10px 20px',
+            background: 'var(--nim-bg-secondary)', borderRadius: 8,
+            border: '1px solid var(--nim-border)', cursor: 'pointer',
+            textDecoration: 'none', color: 'var(--nim-text)', fontWeight: 500,
+          }}>
+            🧠 Agent Compiler → Knowledge compilation with LLM
+          </a>
 
           {folders.length === 0 ? (
             <>

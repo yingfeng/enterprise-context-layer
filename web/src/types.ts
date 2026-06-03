@@ -69,3 +69,20 @@ export interface Document {
   content_hash?: string
   size: number
 }
+
+// ===== Agent Compilation Types =====
+
+export interface CompileTask {
+  id: string
+  status: 'pending' | 'running' | 'success' | 'failed'
+  log: string
+  created_at: string
+  started_at?: string
+  finished_at?: string
+  result?: {
+    commit_id: string
+    files_created: number
+  }
+  error?: string
+  log_preview?: string
+}

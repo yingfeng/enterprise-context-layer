@@ -211,6 +211,10 @@ body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Inter', Robo
 }
 .btn-icon-sm:hover { background: var(--nim-bg-hover); color: var(--nim-text); }
 
+/* ===== Agent Compilation Form ===== */
+.form-field { margin-bottom: 14px; }
+.form-label { display: block; font-size: 12px; font-weight: 600; color: var(--nim-text-muted); margin-bottom: 4px; text-transform: uppercase; letter-spacing: 0.5px; }
+
 /* ===== Editor Toolbar (WorkspacePage) ===== */
 .editor-toolbar {
   display: flex; align-items: center; justify-content: space-between;

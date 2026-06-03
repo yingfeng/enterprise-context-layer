@@ -11,6 +11,7 @@ type Handlers struct {
 	Dataset *handler.DatasetHandler
 	Doc     *handler.DocumentHandler
 	Commit  *handler.CommitHandler
+	Compile *handler.CompileHandler
 }
 
 func Setup(r *gin.Engine, h *Handlers) {
@@ -69,6 +70,15 @@ func Setup(r *gin.Engine, h *Handlers) {
 	api.GET("/folders/:id/commits", h.Commit.ListFolderCommits)
 	api.GET("/commits/:commit_id/tree", h.Commit.GetCommitTreeHandler)
 	api.GET("/commits/:commit_id/files/:file_id/content", h.Commit.GetFileAtCommit)
+
+	// ===== Agent Compile API =====
+	compile := api.Group("/agent/compile")
+	{
+		compile.POST("", h.Compile.StartCompile)          // Start async compilation
+		compile.GET("/list", h.Compile.ListTasks)         // List all compile tasks
+		compile.GET("/:id", h.Compile.GetTask)            // Get task status + logs
+		compile.GET("/:id/logs", h.Compile.StreamLogs)    // SSE log streaming
+	}
 }
 
 

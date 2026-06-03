@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"llmwiki/backend/agent"
 	"llmwiki/backend/config"
 	"llmwiki/backend/dao"
 	"llmwiki/backend/handler"
@@ -34,12 +35,18 @@ func main() {
 	datasetSvc := service.NewDatasetService()
 	docSvc := service.NewDocumentService()
 
-	// 4. Initialize handlers
+	// 4. Initialize Agent Compiler
+	llmClient := agent.NewLLMClient(cfg.LLMAPIKey, cfg.LLMBaseURL, cfg.LLMModel)
+	compiler := agent.NewCompiler(fileSvc, llmClient)
+	log.Printf("Agent compiler initialized (model=%s, base=%s)", cfg.LLMModel, cfg.LLMBaseURL)
+
+	// 5. Initialize handlers
 	h := &router.Handlers{
 		File:    handler.NewFileHandler(fileSvc),
 		Dataset: handler.NewDatasetHandler(datasetSvc),
 		Doc:     handler.NewDocumentHandler(docSvc),
 		Commit:  handler.NewCommitHandler(fileSvc),
+		Compile: handler.NewCompileHandler(compiler),
 	}
 
 	// 5. Setup Gin router
