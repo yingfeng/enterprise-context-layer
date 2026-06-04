@@ -48,6 +48,39 @@ func (l *LLMClient) logf(format string, args ...interface{}) {
 	}
 }
 
+// ChatWithToolCalls sends a chat completion and returns the full response including tool calls.
+func (l *LLMClient) ChatWithToolCalls(ctx context.Context, messages []openai.ChatCompletionMessage, tools []openai.Tool) (*openai.ChatCompletionResponse, error) {
+	l.logf("[LLM] ChatWithToolCalls — %d messages, %d tools\n", len(messages), len(tools))
+
+	req := openai.ChatCompletionRequest{
+		Model:       l.model,
+		Messages:    messages,
+		Temperature: 0.3,
+		MaxTokens:   16384,
+	}
+
+	if len(tools) > 0 {
+		req.Tools = tools
+	}
+
+	start := time.Now()
+	resp, err := l.client.CreateChatCompletion(ctx, req)
+	if err != nil {
+		l.logf("[LLM] Error: %v\n", err)
+		return nil, fmt.Errorf("chat completion: %w", err)
+	}
+	elapsed := time.Since(start)
+	l.logf("[LLM] Response in %v (%d choices)\n", elapsed, len(resp.Choices))
+	l.logf("[LLM] Usage: %d prompt + %d completion tokens\n",
+		resp.Usage.PromptTokens, resp.Usage.CompletionTokens)
+
+	if len(resp.Choices) == 0 {
+		return nil, fmt.Errorf("no choices in response")
+	}
+
+	return &resp, nil
+}
+
 // Chat sends a chat completion request with optional streaming logs.
 func (l *LLMClient) Chat(ctx context.Context, systemPrompt, userPrompt string, tools []openai.Tool) (*LLMResult, error) {
 	l.logf("[LLM] === Request ===\n")

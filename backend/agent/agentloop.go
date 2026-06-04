@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/components/tool"
 	"github.com/cloudwego/eino/schema"
 )
@@ -38,14 +39,21 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 
 	// 1. Create ChatModel
 	chatModel := NewDeepSeekChatModel(cfg.LLM)
-	chatModel.BindTools(nil)
 
 	// 2. Build system prompt from SKILL.md
 	systemPrompt := buildSystemPrompt(cfg)
 
-	// 3. Create tool instances
+	// 3. Create tool instances and collect ToolInfo for function calling
 	compiler := &Compiler{}
 	agentTools := createAgentTools(compiler)
+
+	var toolInfos []*schema.ToolInfo
+	for _, t := range agentTools {
+		info, err := t.Info(ctx)
+		if err == nil {
+			toolInfos = append(toolInfos, info)
+		}
+	}
 
 	// 4. Reset global state
 	globalState = &AgentState{
@@ -56,30 +64,31 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 	// 5. Agent Loop: LLM decides which tool to call next
 	maxTurns := 30
 	turnCount := 0
-
-	toolDescs := formatToolDescriptions(agentTools)
-
-	messages := []*schema.Message{
-		schema.SystemMessage(systemPrompt + "\n\n## 可用工具\n\n" + toolDescs),
-	}
+	autoExecCount := 0
 
 	userContent := cfg.Instructions
 	if userContent == "" {
 		userContent = "请按照上述工作流程，逐步执行知识编译任务。"
 	}
-	messages = append(messages, schema.UserMessage(userContent))
+
+	messages := []*schema.Message{
+		schema.SystemMessage(systemPrompt),
+		schema.UserMessage(userContent),
+	}
 
 	for turnCount < maxTurns {
 		turnCount++
 		globalState.appendLog("[TURN %d] LLM reasoning...\n", turnCount)
 
-		resp, err := chatModel.Generate(ctx, messages)
+		// Pass tool definitions to the LLM via model.WithTools (proper function calling)
+		resp, err := chatModel.Generate(ctx, messages, model.WithTools(toolInfos))
 		if err != nil {
 			globalState.appendLog("[ERROR] LLM call failed: %v\n", err)
 			break
 		}
 
 		if len(resp.ToolCalls) > 0 {
+			// LLM returned structured tool calls via function calling
 			assistantMsg := schema.AssistantMessage(resp.Content, resp.ToolCalls)
 			messages = append(messages, assistantMsg)
 			globalState.appendLog("[TURN %d] LLM called %d tool(s)\n", turnCount, len(resp.ToolCalls))
@@ -98,20 +107,41 @@ func RunAgentLoop(ctx context.Context, cfg *AgentConfig) (*AgentResult, error) {
 				break
 			}
 		} else {
+			// No tool calls — LLM responded in text
 			globalState.appendLog("[TURN %d] LLM response: %s\n", turnCount, truncate(resp.Content, 200))
 			messages = append(messages, schema.AssistantMessage(resp.Content, nil))
 
-			if strings.Contains(resp.Content, "完成") ||
-				strings.Contains(resp.Content, "DONE") ||
-				strings.Contains(resp.Content, "complete") {
+			// Completion check
+			if isCompletionText(resp.Content) {
 				globalState.appendLog("[DONE] LLM indicated completion\n")
 				break
 			}
 
-			if turnCount > 3 && len(globalState.Outputs) > 0 {
+			// Auto-execute: detect tool call intent in text and skip next decision round
+			if toolName, argsJSON, found := parseToolIntent(resp.Content); found && autoExecCount < 3 {
+				autoExecCount++
+				globalState.appendLog("[AUTO] Detected '%s' in text, executing directly\n", toolName)
+				result := executeToolCall(agentTools, toolName, argsJSON)
+				globalState.appendLog("  <- auto result: %s\n", truncate(result, 100))
+
+				// Inject auto-execution result without LLM decision round
+				messages = append(messages, schema.ToolMessage(result, "auto_"+toolName))
+
+				if isTaskComplete(globalState) {
+					break
+				}
+				continue // skip context compression below, go to next LLM turn
+			}
+
+			// Guard: if no progress after several text-only turns, stop
+			if turnCount > 4 && len(globalState.Outputs) == 0 {
+				globalState.appendLog("[GUARD] No progress after %d turns, stopping\n", turnCount)
 				break
 			}
 		}
+
+		// 6. Context compression: prevent unbounded message growth
+		messages = compressContext(messages, 24)
 	}
 
 	elapsed := time.Since(start)
@@ -344,4 +374,99 @@ func outputPaths(outputs []OutputFile) string {
 		paths = append(paths, o.Path)
 	}
 	return strings.Join(paths, "\n")
+}
+
+// ========== Context Compression ==========
+
+// compressContext trims message history to prevent unbounded prompt growth.
+// Keeps the system message + the most recent N message pairs.
+func compressContext(msgs []*schema.Message, maxLen int) []*schema.Message {
+	if len(msgs) <= maxLen {
+		return msgs
+	}
+	// Always keep system message (index 0)
+	compressed := []*schema.Message{msgs[0]}
+	// Keep recent messages
+	start := len(msgs) - (maxLen - 1)
+	if start < 1 {
+		start = 1
+	}
+	compressed = append(compressed, msgs[start:]...)
+	return compressed
+}
+
+// ========== Auto-Execution ==========
+
+var toolIntentPatterns = []struct {
+	name  string
+	check func(string) (string, string, bool)
+}{
+	{name: "load_files", check: func(s string) (string, string, bool) {
+		if containsAny(s, "load_files", "先加载工作区", "首先加载") {
+			return "load_files", `{"workspace_id":""}`, true
+		}
+		return "", "", false
+	}},
+	{name: "scan_topics", check: func(s string) (string, string, bool) {
+		if containsAny(s, "scan_topics", "扫描主题", "发现主题", "开始扫描") {
+			return "scan_topics", "{}", true
+		}
+		return "", "", false
+	}},
+	{name: "generate_index", check: func(s string) (string, string, bool) {
+		if containsAny(s, "generate_index", "生成 INDEX", "创建索引", "INDEX.md") {
+			return "generate_index", "{}", true
+		}
+		return "", "", false
+	}},
+	{name: "generate_log", check: func(s string) (string, string, bool) {
+		if containsAny(s, "generate_log", "生成日志", "log.md") {
+			return "generate_log", "{}", true
+		}
+		return "", "", false
+	}},
+	{name: "consistency_review", check: func(s string) (string, string, bool) {
+		if containsAny(s, "consistency_review", "一致性审查", "交叉引用检查") {
+			return "consistency_review", "{}", true
+		}
+		return "", "", false
+	}},
+	{name: "quality_review", check: func(s string) (string, string, bool) {
+		if containsAny(s, "quality_review", "质量审查", "质量检查") {
+			return "quality_review", "{}", true
+		}
+		return "", "", false
+	}},
+}
+
+// parseToolIntent detects an LLM's intent to call a tool from text.
+// Returns (toolName, argsJSON, found).
+func parseToolIntent(content string) (string, string, bool) {
+	for _, p := range toolIntentPatterns {
+		if name, args, ok := p.check(content); ok {
+			return name, args, true
+		}
+	}
+	// Generic pattern: "调用了 X" / "调用 X" / "执行 X"
+	return "", "", false
+}
+
+// isCompletionText checks if the LLM is indicating task completion.
+func isCompletionText(content string) bool {
+	return containsAny(content,
+		"完成", "DONE", "complete",
+		"任务完成", "编译完成", "全部完成",
+		"以上就是所有", "已全部",
+	)
+}
+
+// containsAny checks if s contains any of the substrings.
+func containsAny(s string, substrs ...string) bool {
+	lower := strings.ToLower(s)
+	for _, sub := range substrs {
+		if strings.Contains(lower, strings.ToLower(sub)) {
+			return true
+		}
+	}
+	return false
 }

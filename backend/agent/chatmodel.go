@@ -5,102 +5,73 @@ import (
 	"encoding/json"
 	"fmt"
 
-	"github.com/cloudwego/eino/components/model"
 	"github.com/cloudwego/eino/schema"
+	openai "github.com/sashabaranov/go-openai"
+
+	"github.com/cloudwego/eino/components/model"
 )
 
 // DeepSeekChatModel wraps LLMClient as a BaseChatModel + ToolCallingChatModel.
-// Enables the agent loop to use our existing DeepSeek API configuration.
 type DeepSeekChatModel struct {
 	client *LLMClient
 	tools  []*schema.ToolInfo
 }
 
-// NewDeepSeekChatModel creates a ChatModel wrapping our LLMClient.
 func NewDeepSeekChatModel(llm *LLMClient) *DeepSeekChatModel {
 	return &DeepSeekChatModel{client: llm}
 }
 
-// Generate implements model.BaseChatModel — synchronous LLM call.
-// opts are runtime options (temperature, tools, etc.). We use our underlying LLMClient config.
+// Generate implements model.BaseChatModel.
+// Properly handles tool definitions via model.GetCommonOptions + model.WithTools.
 func (m *DeepSeekChatModel) Generate(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.Message, error) {
-	// Convert schema.Messages to system + user prompt strings
-	systemMsg, userMsg := messagesToPrompts(input)
+	// Extract options (including tools from model.WithTools)
+	commonOpts := model.GetCommonOptions(&model.Options{}, opts...)
 
-	// Check if tools are configured on this instance
-	if len(m.tools) > 0 {
-		return m.generateWithTools(ctx, systemMsg, userMsg)
+	// Merge instance tools + per-call tools
+	allToolInfos := append([]*schema.ToolInfo{}, m.tools...)
+	allToolInfos = append(allToolInfos, commonOpts.Tools...)
+
+	// Convert messages to OpenAI format
+	openaiMsgs := convertMessages(input)
+
+	if len(allToolInfos) > 0 {
+		// Convert tool infos to OpenAI tools
+		openaiTools := convertToolInfos(allToolInfos)
+		commonOpts.Tools = allToolInfos
+
+		resp, err := m.client.ChatWithToolCalls(ctx, openaiMsgs, openaiTools)
+		if err != nil {
+			return nil, fmt.Errorf("chat with tools: %w", err)
+		}
+
+		return openaiResponseToSchema(resp), nil
 	}
 
 	// Plain chat path
-	content, err := m.client.ChatRaw(ctx, systemMsg, userMsg)
+	resp, err := m.client.ChatWithToolCalls(ctx, openaiMsgs, nil)
 	if err != nil {
-		return nil, fmt.Errorf("deepseek chat: %w", err)
+		return nil, fmt.Errorf("chat: %w", err)
 	}
 
-	return schema.AssistantMessage(content, nil), nil
+	return openaiResponseToSchema(resp), nil
 }
 
-// generateWithTools handles tool-calling mode.
-func (m *DeepSeekChatModel) generateWithTools(ctx context.Context, systemMsg, userMsg string) (*schema.Message, error) {
-	combined := systemMsg
-	if userMsg != "" {
-		combined += "\n\n" + userMsg
-	}
-
-	// Use Chat (not ChatRaw) for structured JSON output
-	result, err := m.client.Chat(ctx, systemMsg, userMsg, nil)
-	if err != nil {
-		// Fallback: call ChatRaw
-		content, err2 := m.client.ChatRaw(ctx, systemMsg, combined)
-		if err2 != nil {
-			return nil, fmt.Errorf("deepseek chat: %w (raw: %v)", err, err2)
-		}
-		return schema.AssistantMessage(content, nil), nil
-	}
-
-	if result != nil && len(result.Files) > 0 {
-		content, _ := json.Marshal(result)
-		return schema.AssistantMessage(string(content), nil), nil
-	}
-
-	content, err := m.client.ChatRaw(ctx, systemMsg, combined)
-	if err != nil {
-		return nil, fmt.Errorf("deepseek chat raw: %w", err)
-	}
-
-	return schema.AssistantMessage(content, nil), nil
-}
-
-// Stream implements model.BaseChatModel — streaming LLM call.
+// Stream is not fully implemented — returns single response wrapped as stream.
 func (m *DeepSeekChatModel) Stream(ctx context.Context, input []*schema.Message, opts ...model.Option) (*schema.StreamReader[*schema.Message], error) {
-	// Create pipe for streaming
 	sr, sw := schema.Pipe[*schema.Message](3)
-
-	systemMsg, userMsg := messagesToPrompts(input)
-
 	go func() {
 		defer sw.Close()
-
-		// Use our existing streaming client
-		_ = m.client.ChatStream(ctx, systemMsg, userMsg)
-
-		// Since ChatStream doesn't return stream data in the same way,
-		// we send the complete result as a single chunk for now.
-		// A full implementation would read from the actual stream.
-		content, err := m.client.ChatRaw(ctx, systemMsg, userMsg)
+		msg, err := m.Generate(ctx, input, opts...)
 		if err != nil {
 			sw.Send(nil, err)
 			return
 		}
-
-		sw.Send(schema.AssistantMessage(content, nil), nil)
+		sw.Send(msg, nil)
 	}()
-
 	return sr, nil
 }
 
-// WithTools implements model.ToolCallingChatModel — returns a new instance with tools bound.
+// WithTools implements model.ToolCallingChatModel.
 func (m *DeepSeekChatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCallingChatModel, error) {
 	newModel := &DeepSeekChatModel{
 		client: m.client,
@@ -109,14 +80,111 @@ func (m *DeepSeekChatModel) WithTools(tools []*schema.ToolInfo) (model.ToolCalli
 	return newModel, nil
 }
 
-// BindTools sets tools on the model (mutates; for internal use).
+// BindTools sets tools on the model.
 func (m *DeepSeekChatModel) BindTools(tools []*schema.ToolInfo) {
 	m.tools = tools
 }
 
-// ========== Helper: Convert schema.Messages to prompt strings ==========
+// ========== Conversion helpers ==========
 
-// messagesToPrompts converts message list to system + user prompt strings.
+// convertMessages converts EINO schema.Messages to OpenAI ChatCompletionMessage format.
+func convertMessages(in []*schema.Message) []openai.ChatCompletionMessage {
+	out := make([]openai.ChatCompletionMessage, 0, len(in))
+	for _, msg := range in {
+		m := openai.ChatCompletionMessage{
+			Role:    string(msg.Role),
+			Content: msg.Content,
+		}
+		// Preserve tool call results
+		if msg.Role == schema.Tool {
+			m.ToolCallID = msg.ToolCallID
+			m.Name = msg.ToolName
+		}
+		// Preserve tool calls from assistant messages
+		if len(msg.ToolCalls) > 0 {
+			m.ToolCalls = convertToolCalls(msg.ToolCalls)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// convertToolInfos converts EINO ToolInfo to OpenAI Tool format.
+func convertToolInfos(infos []*schema.ToolInfo) []openai.Tool {
+	tools := make([]openai.Tool, 0, len(infos))
+	for _, info := range infos {
+		tool := openai.Tool{
+			Type: "function",
+			Function: &openai.FunctionDefinition{
+				Name:        info.Name,
+				Description: info.Desc,
+			},
+		}
+		// Convert ParamsOneOf to JSON Schema if present
+		if info.ParamsOneOf != nil {
+			params, err := info.ParamsOneOf.ToJSONSchema()
+			if err == nil && params != nil {
+				tool.Function.Parameters = anyToMap(params)
+			}
+		}
+		tools = append(tools, tool)
+	}
+	return tools
+}
+
+// convertToolCalls converts EINO ToolCall to OpenAI ToolCall format.
+func convertToolCalls(in []schema.ToolCall) []openai.ToolCall {
+	out := make([]openai.ToolCall, 0, len(in))
+	for _, tc := range in {
+		out = append(out, openai.ToolCall{
+			ID:   tc.ID,
+			Type: openai.ToolTypeFunction,
+			Function: openai.FunctionCall{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		})
+	}
+	return out
+}
+
+// openaiResponseToSchema converts OpenAI response to EINO schema.Message.
+func openaiResponseToSchema(resp *openai.ChatCompletionResponse) *schema.Message {
+	if len(resp.Choices) == 0 {
+		return schema.AssistantMessage("", nil)
+	}
+	choice := resp.Choices[0]
+	msg := choice.Message
+
+	// Convert OpenAI ToolCalls back to EINO format
+	var toolCalls []schema.ToolCall
+	for _, tc := range msg.ToolCalls {
+		toolCalls = append(toolCalls, schema.ToolCall{
+			ID:   tc.ID,
+			Type: string(tc.Type),
+			Function: schema.FunctionCall{
+				Name:      tc.Function.Name,
+				Arguments: tc.Function.Arguments,
+			},
+		})
+	}
+
+	return &schema.Message{
+		Role:      schema.Assistant,
+		Content:   msg.Content,
+		ToolCalls: toolCalls,
+	}
+}
+
+// anyToMap converts a JSON-marshalable value to map[string]any.
+func anyToMap(v any) map[string]any {
+	data, _ := json.Marshal(v)
+	var m map[string]any
+	json.Unmarshal(data, &m)
+	return m
+}
+
+// messagesToPrompts converts messages to system + user strings for legacy use.
 func messagesToPrompts(messages []*schema.Message) (system, user string) {
 	for _, msg := range messages {
 		switch msg.Role {
@@ -131,7 +199,6 @@ func messagesToPrompts(messages []*schema.Message) (system, user string) {
 			}
 			user += msg.Content
 		case schema.Assistant:
-			// Tool calls or responses from previous turns
 			if msg.Content != "" {
 				if user != "" {
 					user += "\n"
