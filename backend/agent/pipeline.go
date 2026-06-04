@@ -291,30 +291,20 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 		c.extractKeywords(task, files)
 	}
 
-	// ── Scan Phase ──
-	var topics []TopicInfo
-	if resumeFrom != "" && saved != nil {
-		topics = saved.Topics
-		task.AppendLog("[CP] Restored %d topics from checkpoint\n", len(topics))
-	} else {
-		topics = c.scanPhase(task, files, skills, input.Instructions)
-		if len(topics) == 0 {
-			return
+	// ── Domain Detection & Compile Phase ──
+	// If workspace has domains/ directory, compile per domain in parallel.
+	// Otherwise, treat all files as a single "wiki" domain.
+
+	domains := groupFilesByDomain(files)
+	if len(domains) > 1 {
+		task.AppendLog("[DOMAIN] Detected %d domains\n", len(domains))
+		for _, d := range domains {
+			task.AppendLog("  - %s (%d files)\n", d.Name, len(d.Files))
 		}
-		cp.SavePhase("scan", topics, nil, nil, len(files), outputDir)
-		task.AppendLog("[CP] Saved checkpoint after scan (%d topics)\n", len(topics))
+	} else {
+		task.AppendLog("[DOMAIN] Single domain '%s' (%d files)\n", domains[0].Name, len(domains[0].Files))
 	}
 
-	// P1: After scan, if instructions are detailed, switch to strict mode
-	if input.Instructions != "" && len(input.Instructions) > 100 {
-		c.modeDec.RecordFailure() // trigger mode switch signal
-		_ = c.modeDec.Decide()
-		task.AppendLog("[MODE] Switched to '%s' mode (detailed instructions)\n", c.modeDec.ModeString())
-	}
-
-	// ── Compile Phase (per-topic checkpoints) ──
-
-	// P2: Compile with budget tracking + circuit breaker (sequential for correctness)
 	compileStart := time.Now()
 	var allOutputs []OutputFile
 	if resumeFrom == "compile" && saved != nil {
@@ -322,45 +312,100 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 		task.AppendLog("[CP] Restored %d compiled articles\n", len(allOutputs))
 	}
 
-	if len(allOutputs) >= len(topics) {
-		task.AppendLog("[COMPILE] All %d topics already compiled\n", len(topics))
-	} else {
-		task.AppendLog("[COMPILE] Compiling %d/%d topics with budget + circuit breaker...\n",
-			len(topics)-len(allOutputs), len(topics))
-		for i, topic := range topics {
+	// Compile: sequential per-domain, parallel via goroutine pool for multiple domains
+	type domainResult struct {
+		name     string
+		articles []OutputFile
+		err      error
+	}
+
+	if len(domains) <= 1 {
+		// Single domain: sequential compile (existing behavior)
+		domain := domains[0]
+		var domainTopics []TopicInfo
+		if len(domain.Files) > 0 {
+			// Scan within domain files
+			c.extractKeywords(task, domain.Files)
+			domainTopics = c.scanPhase(task, domain.Files, skills, input.Instructions)
+		}
+		if len(domainTopics) == 0 && len(domain.Files) > 0 {
+			domainTopics = c.fallbackTopics(domain.Files)
+		}
+		task.AppendLog("[COMPILE] %d topics in domain '%s'\n", len(domainTopics), domain.Name)
+
+		for i, topic := range domainTopics {
 			if i < len(allOutputs) {
-				continue // skip already compiled
+				continue
 			}
-			c.compileSingleTopic(task, &allOutputs, topic, topics, files, outputDir, cp, compileStart, i, len(topics))
+			c.compileSingleTopic(task, &allOutputs, topic, domainTopics, domain.Files, outputDir, cp, compileStart, i, len(domainTopics), skills, domain.Name)
 		}
-	}
-	compileTotal := time.Since(compileStart).Round(time.Second)
-	task.AppendLog("[COMPILE] All %d topics compiled in %v (budget: %s)\n", len(topics), compileTotal, c.budget.Snapshot())
 
-	// ── Consistency Review ──
-	task.AppendLog("[REVIEW] Consistency check across %d articles...\n", len(allOutputs))
-	allOutputs = c.consistencyReview(task, allOutputs)
-
-	// ── Concept Discovery ──
-	if resumeFrom != "concept" || saved == nil || len(saved.AllOutputs) == 0 {
-		concepts := c.conceptPhase(task, topics, allOutputs)
-		for _, concept := range concepts {
-			allOutputs = append(allOutputs, concept)
+		// Single domain: append mapping-notes
+		if len(domainTopics) > 0 {
+			allOutputs = append(allOutputs, generateMappingNote(domain.Name, domainTopics, len(domain.Files)))
 		}
-		cp.SavePhase("concept", topics, nil, allOutputs, len(files), outputDir)
-		task.AppendLog("[CP] Saved checkpoint after concept phase\n")
 	} else {
-		allOutputs = saved.AllOutputs
-		task.AppendLog("[CP] Restored concept phase (%d files)\n", len(allOutputs))
+		// Multiple domains: parallel compile per domain sub-agent
+		const maxParallelDomains = 3
+		sem := make(chan struct{}, maxParallelDomains)
+		resultCh := make(chan domainResult, len(domains))
+
+		for _, d := range domains {
+			sem <- struct{}{}
+			go func(dg DomainGroup) {
+				defer func() { <-sem }()
+
+				// Each domain sub-agent: scan + compile
+				c.extractKeywords(task, dg.Files)
+				domainTopics := c.scanPhase(task, dg.Files, skills, input.Instructions)
+				if len(domainTopics) == 0 && len(dg.Files) > 0 {
+					domainTopics = c.fallbackTopics(dg.Files)
+				}
+
+				var outputs []OutputFile
+				for _, t := range domainTopics {
+					article := c.compilePhase(task, t, dg.Files, domainTopics, nil, outputDir, skills, dg.Name)
+					if article != nil {
+						outputs = append(outputs, *article)
+					}
+				}
+
+				// Append mapping-notes for this domain
+				if len(domainTopics) > 0 {
+					outputs = append(outputs, generateMappingNote(dg.Name, domainTopics, len(dg.Files)))
+				}
+
+				resultCh <- domainResult{
+					name:     dg.Name,
+					articles: outputs,
+				}
+			}(d)
+		}
+
+		for range domains {
+			res := <-resultCh
+			if res.err != nil {
+				task.AppendLog("[DOMAIN] Domain '%s' compile failed: %v\n", res.name, res.err)
+			} else {
+				task.AppendLog("[DOMAIN] Domain '%s': %d articles compiled\n", res.name, len(res.articles))
+				allOutputs = append(allOutputs, res.articles...)
+			}
+		}
 	}
 
-	// ── INDEX.md + log.md ──
-	allOutputs = append(allOutputs,
-		c.generateIndex(task, topics, len(files), outputDir),
-		c.generateLog(task, topics, len(files), outputDir))
+	// Consistency review (now with domain-aware backlinks)
+	if len(allOutputs) > 0 {
+		task.AppendLog("[REVIEW] Consistency check across %d articles...\n", len(allOutputs))
+		allOutputs = c.consistencyReview(task, allOutputs)
+	}
 
-	// ── Quality Review ──
-	allOutputs = c.qualityReview(task, topics, allOutputs)
+	compileTotal := time.Since(compileStart).Round(time.Second)
+	task.AppendLog("[COMPILE] All domains compiled in %v (budget: %s)\n", compileTotal, c.budget.Snapshot())
+
+	// ── INDEX.md + log.md (domain-aware) ──
+	allOutputs = append(allOutputs,
+		generateDomainIndex(domains, allOutputs),
+		c.generateLogECL(task, domains, len(files), outputDir))
 
 	// Write + commit
 	created, outputWkspID, err := c.writeOutputFiles(task, input, outputDir, allOutputs)
@@ -387,7 +432,7 @@ func (c *Compiler) runCompile(task *TaskState, input *CompileInput) {
 }
 
 // P2: compileSingleTopic handles one topic with budget tracking, circuit breaker, and checkpoint.
-func (c *Compiler) compileSingleTopic(task *TaskState, allOutputs *[]OutputFile, topic TopicInfo, topics []TopicInfo, files []FileNode, outputDir string, cp *CheckpointManager, compileStart time.Time, idx, total int) bool {
+func (c *Compiler) compileSingleTopic(task *TaskState, allOutputs *[]OutputFile, topic TopicInfo, topics []TopicInfo, files []FileNode, outputDir string, cp *CheckpointManager, compileStart time.Time, idx, total int, skills []SkillDef, domain string) bool {
 	// P2: Circuit breaker — skip if too many consecutive failures
 	if !c.budget.CheckCircuitBreaker(topic.Name) {
 		failCount := c.budget.ConsecutiveFailCount(topic.Name)
@@ -400,7 +445,7 @@ func (c *Compiler) compileSingleTopic(task *TaskState, allOutputs *[]OutputFile,
 	c.budget.ResetForNewTopic(topic.Name)
 
 	tStart := time.Now()
-	article := c.compilePhase(task, topic, files, topics, *allOutputs, outputDir)
+	article := c.compilePhase(task, topic, files, topics, *allOutputs, outputDir, skills, domain)
 	elapsed := time.Since(tStart).Round(time.Second)
 
 	if article != nil {
@@ -561,7 +606,7 @@ func (c *Compiler) scanPhase(task *TaskState, files []FileNode, skills []SkillDe
 	task.AppendLog("[SCAN] Analyzing %d files to discover topics...\n", len(files))
 
 	if len(files) <= scanBatchSize {
-		return c.scanBatch(task, files, instructions)
+		return c.scanBatch(task, files, skills, instructions)
 	}
 
 	// Large workspace: scan in parallel sub-batches, then merge
@@ -585,7 +630,7 @@ func (c *Compiler) scanPhase(task *TaskState, files []FileNode, skills []SkillDe
 
 		go func(idx int, bf []FileNode) {
 			task.AppendLog("[SCAN] Sub-agent %d: scanning files %d-%d...\n", idx+1, idx*scanBatchSize+1, idx*scanBatchSize+len(bf))
-			topics := c.scanBatch(task, bf, instructions)
+			topics := c.scanBatch(task, bf, skills, instructions)
 			resultCh <- batchResult{index: idx, topics: topics}
 		}(batchNum, batch)
 	}
@@ -613,13 +658,18 @@ func (c *Compiler) scanPhase(task *TaskState, files []FileNode, skills []SkillDe
 }
 
 // scanBatch scans a single batch of files for topics with timeout and retry.
-func (c *Compiler) scanBatch(task *TaskState, files []FileNode, instructions string) []TopicInfo {
+func (c *Compiler) scanBatch(task *TaskState, files []FileNode, skills []SkillDef, instructions string) []TopicInfo {
 	var b strings.Builder
 	b.WriteString("分析以下源文件，发现其中的知识主题。\n\n")
 	b.WriteString("规则：\n")
 	b.WriteString("1. 共享关键词的文件归为同一主题\n")
 	b.WriteString("2. 一个文件可能属于多个主题\n")
 	b.WriteString("3. 主题名用 kebab-case\n\n")
+
+	// Inject skills content into scan prompt
+	for _, s := range skills {
+		b.WriteString(fmt.Sprintf("## 编译规则：%s\n\n%s\n\n", s.Name, s.Content))
+	}
 
 	b.WriteString("文件列表：\n\n")
 	for _, f := range files {
@@ -755,11 +805,11 @@ func (c *Compiler) fallbackTopics(files []FileNode) []TopicInfo {
 
 // ========== Claude Code-style Compile: Understand → Read → Write → Verify ==========
 
-func (c *Compiler) compilePhase(task *TaskState, topic TopicInfo, allFiles []FileNode, allTopics []TopicInfo, compiled []OutputFile, outputDir string) *OutputFile {
-	task.AppendLog("[COMPILE] Topic '%s' (%d sources)...\n", topic.Name, len(topic.SourcePaths))
+func (c *Compiler) compilePhase(task *TaskState, topic TopicInfo, allFiles []FileNode, allTopics []TopicInfo, compiled []OutputFile, outputDir string, skills []SkillDef, domain string) *OutputFile {
+	task.AppendLog("[COMPILE] Topic '%s' (%d sources, domain: %s)...\n", topic.Name, len(topic.SourcePaths), domain)
 
 	// P2: Dynamic compression — build context with volume-aware compression
-	context := c.buildCompileContext(topic, allTopics, compiled)
+	context := c.buildCompileContext(topic, allTopics, compiled, skills, domain)
 
 	// Collect the topic's source files
 	var relevantFiles []FileNode
@@ -893,7 +943,12 @@ REASON: 简要说明为什么需要这些文件`
 	// P0: Session Note — extract structured note for future reference
 	_ = c.extractSessionNote(article, topic.Name)
 
-	return &OutputFile{Path: topic.Name + ".md", Content: article}
+	// Add front-matter with last_verified date
+	article = addFrontMatter(article, domain)
+
+	// Output path: domains/{domain}/{topic}.md or {topic}.md for wiki
+	outputPath := outputPathForDomain(domain, topic.Name)
+	return &OutputFile{Path: outputPath, Content: article}
 }
 
 // P1: Mode-aware Quality Gate — checks article for minimum quality standards.
@@ -994,9 +1049,16 @@ func (c *Compiler) extractSessionNote(article string, topicName string) string {
 // Compression ratio adjusts dynamically based on compiled article count,
 // session token budget, and execution mode.
 // Modeled after iceCoder's ContextCompactor.
-func (c *Compiler) buildCompileContext(topic TopicInfo, allTopics []TopicInfo, compiled []OutputFile) string {
+func (c *Compiler) buildCompileContext(topic TopicInfo, allTopics []TopicInfo, compiled []OutputFile, skills []SkillDef, domain string) string {
 	var b strings.Builder
-	b.WriteString(fmt.Sprintf("编译主题「%s」的知识文章。\n\n", topic.Description))
+	b.WriteString(fmt.Sprintf("编译领域「%s」下的主题「%s」的知识文章。\n\n", domain, topic.Description))
+
+	// Inject skills content into compile context (mandatory compilation rules)
+	for _, s := range skills {
+		if s.Content != "" {
+			b.WriteString(fmt.Sprintf("## 强制编译规则：%s\n\n%s\n\n", s.Name, s.Content))
+		}
+	}
 
 	// Other topics for cross-linking
 	b.WriteString("其他已发现主题供交叉引用：\n")
@@ -1533,6 +1595,18 @@ func (c *Compiler) generateLog(task *TaskState, topics []TopicInfo, fileCount in
 	content := fmt.Sprintf("## %s\n\n**创建的主题:** %s\n**处理的源文件:** %d\n",
 		today, strings.Join(names, ", "), fileCount)
 	return OutputFile{Path: "log.md", Content: content}
+}
+
+func (c *Compiler) generateLogECL(task *TaskState, domains []DomainGroup, fileCount int, outputDir string) OutputFile {
+	today := time.Now().Format("2006-01-02")
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("## %s\n\n", today))
+	b.WriteString(fmt.Sprintf("**处理的源文件:** %d\n\n", fileCount))
+	b.WriteString("**已编译领域:**\n")
+	for _, d := range domains {
+		b.WriteString(fmt.Sprintf("- %s (%d 文件)\n", d.Name, len(d.Files)))
+	}
+	return OutputFile{Path: "log.md", Content: b.String()}
 }
 
 // ========== File & Skills Loading ==========
