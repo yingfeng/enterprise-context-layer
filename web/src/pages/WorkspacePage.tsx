@@ -3,6 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import type { TreeNode, FileCommit, Dataset } from '../types'
 import * as api from '../api'
 import MarkdownEditor from '../components/MarkdownEditor'
+import JsonEditor from '../components/JsonEditor'
 import GraphView from '../components/GraphView'
 import { useTheme } from '../lib/theme/ThemeContext'
 import { buildGraph, type GraphNode, type GraphEdge } from '../lib/graph/wiki-graph'
@@ -96,7 +97,20 @@ export default function WorkspacePage() {
   async function handleCreateFile() {
     if (!newFileName.trim() || !curFolder || !dataset) return
     try {
-      await api.createTextFile(curFolder.id, newFileName.trim(), `# ${newFileName.trim()}\n\n`)
+      const defaultContent = newFileName.trim().endsWith('.json')
+      ? JSON.stringify({
+  nodes: [
+    { id: 'a', label: 'Start', type: 'start' },
+    { id: 'b', label: 'Process', type: 'process' },
+    { id: 'c', label: 'End', type: 'end' },
+  ],
+  edges: [
+    { source: 'a', target: 'b' },
+    { source: 'b', target: 'c' },
+  ],
+}, null, 2)
+      : `# ${newFileName.trim()}\n\n`
+    await api.createTextFile(curFolder.id, newFileName.trim(), defaultContent)
       setShowNewFile(false); setNewFileName('')
       await refreshCurFolder()
     } catch (e: any) { setError('Create failed: ' + e.message) }
@@ -327,7 +341,7 @@ export default function WorkspacePage() {
         </div>
         {isExpanded && children.map(child => {
           if (child.type === 'folder') return renderTree(child, depth + 1)
-          if (child.type === 'file' && child.name.endsWith('.md')) {
+          if (child.type === 'file' && (child.name.endsWith('.md') || child.name.endsWith('.json'))) {
             const isFileActive = selFile?.id === child.id
             return (
               <div
@@ -491,12 +505,21 @@ export default function WorkspacePage() {
                 {dirty && <button className="btn-primary" onClick={() => setShowCommitDlg(true)}>Commit Changes</button>}
               </div>
             </div>
-            <MarkdownEditor
-              key={selFile.id}
-              content={content}
-              onChange={text => { setContent(text); setDirty(text !== origContent) }}
-              fileName={selFile?.name}
-            />
+            {selFile.name.endsWith('.json') ? (
+              <JsonEditor
+                key={selFile.id}
+                content={content}
+                onChange={text => { setContent(text); setDirty(text !== origContent) }}
+                fileName={selFile?.name}
+              />
+            ) : (
+              <MarkdownEditor
+                key={selFile.id}
+                content={content}
+                onChange={text => { setContent(text); setDirty(text !== origContent) }}
+                fileName={selFile?.name}
+              />
+            )}
             {dirty && (
               <div className="editor-footer">
                 <span className="footer-dirty">● Unsaved changes</span>

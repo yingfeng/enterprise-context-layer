@@ -15,6 +15,7 @@ interface Props {
   onChange?: (value: string) => void;
   readOnly?: boolean;
   onToggleSource?: () => void;
+  language?: string;
 }
 
 function defineTheme(monaco: typeof import('monaco-editor'), isDark: boolean) {
@@ -46,7 +47,7 @@ function defineTheme(monaco: typeof import('monaco-editor'), isDark: boolean) {
   return name;
 }
 
-export default function RawMarkdownEditor({ content, onChange, readOnly = false, onToggleSource, showSource: _showSource }: Props & { showSource?: boolean }): JSX.Element {
+export default function RawMarkdownEditor({ content, onChange, readOnly = false, onToggleSource, showSource: _showSource, language = 'markdown' }: Props & { showSource?: boolean }): JSX.Element {
   const { theme } = useTheme();
   const editorRef = useRef<monacoEditor.IStandaloneCodeEditor | null>(null);
   const monacoRef = useRef<typeof import('monaco-editor') | null>(null);
@@ -102,7 +103,7 @@ export default function RawMarkdownEditor({ content, onChange, readOnly = false,
       <div style={{ flex: 1, minHeight: 0 }}>
         <Editor
           height="100%"
-          defaultLanguage="markdown"
+          defaultLanguage={language}
           value={content}
           onChange={handleChange}
           onMount={handleMount}
