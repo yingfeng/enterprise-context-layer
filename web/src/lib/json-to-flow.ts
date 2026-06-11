@@ -11,6 +11,7 @@
 export interface FlowNodeData {
   label: string
   type?: 'start' | 'process' | 'decision' | 'end'
+  shape?: string
   [key: string]: unknown
 }
 
@@ -18,6 +19,8 @@ export interface FlowEdgeData {
   source: string
   target: string
   label?: string
+  flowType?: string
+  [key: string]: unknown
 }
 
 export interface FlowResult {
@@ -54,7 +57,8 @@ function scanForNodesEdges(obj: unknown, path: string, depth: number): FlowResul
         const id = String(n.id ?? n.name ?? '')
         const label = String(n.label ?? n.name ?? n.id ?? id)
         const type = (typeof n.type === 'string' && ['start', 'end', 'process', 'decision'].includes(n.type) ? n.type : 'process') as FlowNodeData['type']
-        return { id, data: { label, type } }
+        const shape = typeof n.shape === 'string' ? n.shape : undefined
+        return { id, data: { label, type, shape } }
       }).filter(Boolean) as { id: string; data: FlowNodeData }[]
 
       const edges = edgesRaw.map((e: unknown) => {
@@ -62,8 +66,9 @@ function scanForNodesEdges(obj: unknown, path: string, depth: number): FlowResul
         const source = String(e.source ?? e.from ?? '')
         const target = String(e.target ?? e.to ?? '')
         if (!source || !target) return null
-        return { source, target, label: e.label ? String(e.label) : undefined }
-      }).filter(Boolean) as { source: string; target: string; label?: string }[]
+        const flowType = typeof e.flowType === 'string' ? e.flowType : undefined
+        return { source, target, label: e.label ? String(e.label) : undefined, flowType }
+      }).filter(Boolean) as { source: string; target: string; label?: string; flowType?: string }[]
 
       if (nodes.length > 0 && edges.length > 0) {
         return { nodes, edges, detectedPath: path || '(root)' }
@@ -87,7 +92,8 @@ function scanForNodesEdges(obj: unknown, path: string, depth: number): FlowResul
           const id = String(obj.id ?? i)
           const label = String(obj.label ?? obj.name ?? obj.title ?? obj.id ?? `Step ${i + 1}`)
           const type = (typeof obj.type === 'string' && ['start', 'end', 'process', 'decision'].includes(obj.type) ? obj.type : 'process') as FlowNodeData['type']
-          return { id, data: { label, type } }
+          const shape = typeof obj.shape === 'string' ? obj.shape : undefined
+          return { id, data: { label, type, shape } }
         })
 
         const edges: { source: string; target: string; label?: string }[] = []

@@ -1,0 +1,16 @@
+{
+  "nodes": [
+    { "id": "a", "label": "开始", "type": "start", "shape": "circle" },
+    { "id": "b", "label": "处理", "type": "process", "shape": "hexagon" },
+    { "id": "c", "label": "判断", "type": "decision", "shape": "diamond" },
+    { "id": "d", "label": "数据库", "type": "process", "shape": "cylinder" },
+    { "id": "e", "label": "完成", "type": "end", "shape": "rect" }
+  ],
+  "edges": [
+    { "source": "a", "target": "b", "label": "进入", "flowType": "control" },
+    { "source": "b", "target": "c", "label": "结果", "flowType": "data" },
+    { "source": "c", "target": "b", "label": "重试", "flowType": "feedback" },
+    { "source": "c", "target": "d", "label": "保存", "flowType": "write" },
+    { "source": "d", "target": "e", "label": "返回", "flowType": "control" }
+  ]
+}

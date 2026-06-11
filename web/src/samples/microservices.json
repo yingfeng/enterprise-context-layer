@@ -1,0 +1,31 @@
+{
+  "nodes": [
+    { "id": "web", "label": "Web App", "type": "start", "shape": "rect" },
+    { "id": "auth", "label": "Auth Service", "type": "process", "shape": "rect" },
+    { "id": "api", "label": "API Gateway", "type": "process", "shape": "hexagon" },
+    { "id": "user", "label": "User Service", "type": "process", "shape": "rect" },
+    { "id": "order", "label": "Order Service", "type": "process", "shape": "rect" },
+    { "id": "payment", "label": "Payment Service", "type": "process", "shape": "rect" },
+    { "id": "pg", "label": "PostgreSQL", "type": "process", "shape": "cylinder" },
+    { "id": "redis", "label": "Redis Cache", "type": "process", "shape": "cylinder" },
+    { "id": "mq", "label": "Message Queue", "type": "process", "shape": "cylinder" },
+    { "id": "ml", "label": "ML Model", "type": "process", "shape": "double_rect" },
+    { "id": "log", "label": "Log Aggregator", "type": "process", "shape": "document" }
+  ],
+  "edges": [
+    { "source": "web", "target": "auth", "label": "登录", "flowType": "write" },
+    { "source": "web", "target": "api", "label": "API 请求", "flowType": "control" },
+    { "source": "api", "target": "user", "label": "查询用户", "flowType": "read" },
+    { "source": "api", "target": "order", "label": "创建订单", "flowType": "write" },
+    { "source": "order", "target": "payment", "label": "发起支付", "flowType": "control" },
+    { "source": "user", "target": "pg", "label": "CRUD", "flowType": "data" },
+    { "source": "order", "target": "pg", "label": "CRUD", "flowType": "data" },
+    { "source": "payment", "target": "pg", "label": "持久化", "flowType": "write" },
+    { "source": "payment", "target": "mq", "label": "发送事件", "flowType": "async" },
+    { "source": "api", "target": "redis", "label": "缓存查询", "flowType": "read" },
+    { "source": "api", "target": "ml", "label": "推荐请求", "flowType": "async" },
+    { "source": "ml", "target": "api", "label": "推荐结果", "flowType": "data" },
+    { "source": "order", "target": "mq", "label": "订单事件", "flowType": "async" },
+    { "source": "mq", "target": "log", "label": "消费日志", "flowType": "feedback" }
+  ]
+}

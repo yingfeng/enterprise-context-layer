@@ -1,0 +1,16 @@
+{
+  "pipeline": {
+    "name": "CI/CD Pipeline",
+    "stages": [
+      { "id": "code", "label": "代码提交", "type": "start", "shape": "circle" },
+      { "id": "lint", "label": "Lint 检查", "type": "process", "shape": "rect", "next": "test" },
+      { "id": "test", "label": "单元测试", "type": "process", "shape": "rect", "next": "build" },
+      { "id": "build", "label": "编译构建", "type": "process", "shape": "document" },
+      { "id": "quality", "label": "质量门禁", "type": "decision", "shape": "diamond" },
+      { "id": "notify", "label": "失败通知", "type": "process", "shape": "speech" },
+      { "id": "deploy", "label": "自动部署", "type": "process", "shape": "terminal" }
+    ]
+  },
+  "triggers": ["push", "pull_request"],
+  "timeout_minutes": 30
+}
